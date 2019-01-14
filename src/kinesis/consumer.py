@@ -41,8 +41,6 @@ class KinesisConsumer(object):
         else:
             self.record_queue = self.manager.Queue()
         self.restart_queue = self.manager.Queue()
-        # Get things started...
-        self.client = self.boto3_session.client('kinesis')
         self.manager_proc = None
 
     def __iter__(self):
@@ -254,7 +252,7 @@ class KinesisConsumer(object):
         retries = 0
         while self.run:
             try:
-                resp = self.client.get_records(ShardIterator=curr_iter)
+                resp = self.kinesis_client.get_records(ShardIterator=curr_iter)
             except ClientError as exc:
                 if exc.response['Error']['Code'] in RETRY_EXCEPTIONS:
                     # sleep for 1 second the first loop, 1 second the next, then 2, 4, 6, 8, ..., up to a max of 30 or
