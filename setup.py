@@ -3,8 +3,9 @@ from setuptools import setup, find_packages
 with open('VERSION') as version_fd:
     version = version_fd.read().strip()
 
-with open('README.rst', 'r') as readme_fd:
-    long_description = readme_fd.read()
+#with open('README.rst', 'r') as readme_fd:
+#    long_description = readme_fd.read()
+long_description = 'Low level, multiprocessing based AWS Kinesis producer & consumer library'
 
 setup(
     name='kinesis-python',
@@ -15,7 +16,6 @@ setup(
 
     install_requires=[
         'boto3>=1.4.4,<2.0',
-        'offspring>=0.0.3,<1.0',
         'six>=1.11.0,<2.0',
     ],
     packages=find_packages('src'),

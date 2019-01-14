@@ -1,18 +1,16 @@
 import collections
 import logging
-import multiprocessing
+from multiprocessing import Process, Queue, Manager
 try:
-    import Queue
-except ImportError:
     # Python 3
-    import queue as Queue
+    import queue
+except ImportError:
+    import Queue as queue
 import sys
 import time
 
 import boto3
 import six
-
-from offspring.process import SubprocessLoop
 
 log = logging.getLogger(__name__)
 
@@ -47,81 +45,153 @@ def sizeof(obj, seen=None):
     return size
 
 
-class AsyncProducer(SubprocessLoop):
-    """Async accumulator and producer based on a multiprocessing Queue"""
-    # Tell our subprocess loop that we don't want to terminate on shutdown since we want to drain our queue first
-    TERMINATE_ON_SHUTDOWN = False
+class KinesisProducer(object):
+    """Produce to Kinesis streams via an AsyncProducer"""
 
-    # Max size & count
-    # Per: https://docs.aws.amazon.com/streams/latest/dev/service-sizes-and-limits.html
-    #
-    # * The maximum size of a data blob (the data payload before base64-encoding) is up to 1 MB.
-    # * Each shard can support up to 1,000 records per second for writes, up to a maximum total data write rate of 1 MB
-    #   per second (including partition keys).
-    # * PutRecords supports up to 500 records in a single call
     MAX_SIZE = (2 ** 20)
-    MAX_COUNT = 500
+    MAX_COUNT = 1000
 
-    def __init__(self, stream_name, buffer_time, queue, max_count=None, max_size=None, boto3_session=None):
+    def __init__(self, stream_name, buffer_time=0.5, max_count=None, max_size=None, boto3_session=None,
+                 max_queue_size=None, endpoint_url=None):
         self.stream_name = stream_name
         self.buffer_time = buffer_time
-        self.queue = queue
+        self.max_count = max_count
+        self.max_size = max_size
+        self.boto3_session = boto3_session
+        self.max_queue_size = max_queue_size
+        self.max_queue_size = max_queue_size
+        self.manager = Manager()
+        if self.max_queue_size:
+            self.queue = self.manager.Queue(maxsize=self.max_queue_size)
+        else:
+            self.queue = self.manager.Queue()
         self.records = []
         self.next_records = []
         self.alive = True
         self.max_count = max_count or self.MAX_COUNT
         self.max_size = max_size or self.MAX_SIZE
+        self.async_producer = None
 
         if boto3_session is None:
             boto3_session = boto3.Session()
-        self.client = boto3_session.client('kinesis')
+        self.client = boto3_session.client('kinesis', endpoint_url=endpoint_url)
 
-        self.start()
+    def start(self):
+        log.debug("Starting producer...")
+        self._setup_producer()
 
-    def loop(self):
-        records_size = 0
-        records_count = 0
-        timer_start = time.time()
+    def _setup_producer(self):
+        # Don't do anything if we have a producer...
+        if hasattr(self, "async_producer") and self.async_producer and self.async_producer.is_alive():
+            return
 
-        while self.alive and (time.time() - timer_start) < self.buffer_time:
-            # we want our queue to block up until the end of this buffer cycle, so we set out timeout to the amount
-            # remaining in buffer_time by substracting how long we spent so far during this cycle
-            queue_timeout = self.buffer_time - (time.time() - timer_start)
+        if hasattr(self, "async_producer"):
+            del self.async_producer
+
+        self.async_producer = Process(target=self._run_writer)
+        self.async_producer.start()
+
+    def _run_writer(self):
+        while self.alive:
+            records_size = 0
+            records_count = 0
+            timer_start = time.time()
+            log.debug("{0} items in producer queue.".format(self.queue))
             try:
-                log.debug("Fetching from queue with timeout: %s", queue_timeout)
-                data, explicit_hash_key, partition_key = self.queue.get(block=True, timeout=queue_timeout)
-            except Queue.Empty:
-                continue
+                while self.alive and (time.time() - timer_start) < self.buffer_time:
+                    # we want our queue to block up until the end of this buffer cycle, so we set out timeout to the amount
+                    # remaining in buffer_time by substracting how long we spent so far during this cycle
+                    queue_timeout = self.buffer_time - (time.time() - timer_start)
+                    try:
+                        log.debug("Fetching from queue with timeout: %s", queue_timeout)
+                        data, explicit_hash_key, partition_key = self.queue.get(block=True, timeout=queue_timeout)
+                    except queue.Empty:
+                        pass
+                    # except EOFError:
+                    #     pass
+                    except UnicodeDecodeError as exc:
+                        log.exception("UnicodeDecodeError Exception: {0}".format(exc))
+                        log.error("Ignoring UnicodeDecodeError Exception: {0}".format(exc))
+                        pass
+                    except Exception as exc:
+                        log.exception("UNHANDLED EXCEPTION {0}".format(exc))
+                        log.error("Shutting down...")
+                        # self.alive = False
+                        return False
+                    else:
+                        # record_queue.task_done()
+                        record = {
+                            'Data': data,
+                            'PartitionKey': partition_key or '{0}{1}'.format(time.clock(), time.time()),
+                        }
+                        if explicit_hash_key is not None:
+                            record['ExplicitHashKey'] = explicit_hash_key
 
-            record = {
-                'Data': data,
-                'PartitionKey': partition_key or '{0}{1}'.format(time.clock(), time.time()),
-            }
-            if explicit_hash_key is not None:
-                record['ExplicitHashKey'] = explicit_hash_key
+                        # Get the size of any leftover records
+                        for i in self.records:
+                            records_size += sizeof(i)
+                            records_count += 1
 
-            records_size += sizeof(record)
-            if records_size >= self.max_size:
-                log.debug("Records exceed MAX_SIZE (%s)!  Adding to next_records: %s", self.max_size, record)
-                self.next_records = [record]
-                break
+                        records_size += sizeof(record)
+                        if records_size >= self.max_size:
+                            # log.debug("Records exceed MAX_SIZE (%s)!  Adding to next_records: %s", self.max_size, record)
+                            log.debug("Records exceed MAX_SIZE (%s)!", self.max_size)
+                            self.next_records = [record]
+                            break
 
-            log.debug("Adding to records (%d bytes): %s", records_size, record)
-            self.records.append(record)
+                        # log.debug("Adding to records (%d bytes): %s", records_size, record)
+                        log.debug("Adding to records (%d bytes)", records_size)
+                        self.records.append(record)
 
-            records_count += 1
-            if records_count == self.max_count:
-                log.debug("Records have reached MAX_COUNT (%s)!  Flushing records.", self.max_count)
-                break
-
+                        records_count += 1
+                        if records_count == self.max_count:
+                            log.debug("Records have reached MAX_COUNT (%s)!  Flushing records.", self.max_count)
+                            break
+            except OSError as exc:
+                log.exception("OSError Exception: {0}".format(exc))
+                # This is a memory problem, most likely.
+                return False
+            log.debug("Attempting to flush {0} records...".format(len(self.records)))
+            self.flush_records()
+        log.debug("Ending producer, flushing {0} records...".format(len(self.records)))
         self.flush_records()
-        return 0
+        self.alive = False
+        log.info("Producer Ended...")
+        return False
 
-    def end(self):
-        # At the end of our loop (before we exit, i.e. via a signal) we change our buffer time to 250ms and then re-call
-        # the loop() method to ensure that we've drained any remaining items from our queue before we exit.
-        self.buffer_time = 0.25
-        self.loop()
+    def put(self, data, explicit_hash_key=None, partition_key=None):
+        if hasattr(self, "async_producer") and not self.async_producer.is_alive():
+            # self.async_producer.shutdown()
+            self._setup_producer()
+        try:
+            self.queue.put((data, explicit_hash_key, partition_key), block=True, timeout=0.25)
+        except Queue.Full:
+            if hasattr(self, "async_producer") and not self.async_producer.is_alive():
+                # self.async_producer.shutdown()
+                self._setup_producer()
+        except Exception as exc:
+            log.exception("UNHANDLED EXCEPTION {0}".format(exc))
+            log.error("Shutting down...")
+            self.shutdown()
+            raise
+
+    def shutdown(self):
+        log.debug("Shutting down the producer...")
+        max_retries = 30
+
+        # If our process is dead, it's dead.
+        if self.async_producer.is_alive() is False:
+            log.debug("Producer process is dead.")
+        else:
+            log.debug("Waiting for queue to empty...")
+            while self.async_producer.is_alive() and not self.queue.empty() and max_retries > 0:
+                max_retries -= 1
+                log.debug("Waiting for queue to empty, sleeping one second.")
+                time.sleep(1)
+        log.debug("Queue is empty, terminating process...")
+        self.alive = False
+        self.async_producer.kill()
+        self.async_producer.join()
 
     def flush_records(self):
         if self.records:
@@ -130,17 +200,7 @@ class AsyncProducer(SubprocessLoop):
                 StreamName=self.stream_name,
                 Records=self.records
             )
-
+            log.debug("Flushed %d records", len(self.records))
+            log.debug("%d next records", len(self.next_records))
         self.records = self.next_records
         self.next_records = []
-
-
-class KinesisProducer(object):
-    """Produce to Kinesis streams via an AsyncProducer"""
-    def __init__(self, stream_name, buffer_time=0.5, max_count=None, max_size=None, boto3_session=None):
-        self.queue = multiprocessing.Queue()
-        self.async_producer = AsyncProducer(stream_name, buffer_time, self.queue, max_count=max_count,
-                                            max_size=max_size, boto3_session=boto3_session)
-
-    def put(self, data, explicit_hash_key=None, partition_key=None):
-        self.queue.put((data, explicit_hash_key, partition_key))
